@@ -1,0 +1,70 @@
+name: Sync SAP CPI iFlow
+
+on:
+  workflow_dispatch:
+    inputs:
+      packageId:
+        description: Package ID
+        required: true
+
+jobs:
+
+  sync:
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - uses: actions/checkout@v4
+
+      - name: Install jq
+        run: sudo apt-get install jq -y
+
+      - name: Get OAuth Token
+        id: token
+        run: |
+
+          TOKEN=$(curl -s \
+          --request POST \
+          "${{ secrets.TOKEN_URL }}" \
+          --header "Content-Type: application/x-www-form-urlencoded" \
+          --data-urlencode "grant_type=client_credentials" \
+          --data-urlencode "client_id=${{ secrets.CLIENT_ID }}" \
+          --data-urlencode "client_secret=${{ secrets.CLIENT_SECRET }}" \
+          | jq -r '.access_token')
+
+          echo "TOKEN=$TOKEN" >> $GITHUB_ENV
+
+      - name: Get Package Details
+
+        run: |
+
+          curl \
+          --location \
+          --header "Authorization: Bearer $TOKEN" \
+          "${{ secrets.BASE_URL }}/api/v1/IntegrationPackages('${{ github.event.inputs.packageId }}')"
+
+      - name: Download Package
+
+        run: |
+
+          mkdir iflows
+
+          curl \
+          --location \
+          --header "Authorization: Bearer $TOKEN" \
+          "${{ secrets.BASE_URL }}/api/v1/IntegrationPackages('${{ github.event.inputs.packageId }}')/\$value" \
+          --output iflows/package.zip
+
+      - name: Commit
+
+        run: |
+
+          git config --global user.email "github-actions@github.com"
+          git config --global user.name "GitHub Actions"
+
+          git add .
+
+          git commit -m "Sync CPI Package" || echo "Nothing to commit"
+
+          git push
