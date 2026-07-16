@@ -1,5 +1,6 @@
 name: Sync SAP CPI iFlow
-
+permissions:
+  contents: write
 on:
   workflow_dispatch:
     inputs:
