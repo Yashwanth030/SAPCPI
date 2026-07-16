@@ -13,11 +13,9 @@ on:
 
 jobs:
   sync:
-
     runs-on: ubuntu-latest
 
     steps:
-
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
@@ -29,7 +27,6 @@ jobs:
           sudo apt-get install -y jq
 
       - name: Get OAuth Token
-        id: oauth
         run: |
           TOKEN=$(curl -s \
             --request POST \
@@ -44,17 +41,22 @@ jobs:
 
       - name: Verify Token
         run: |
-          if [ -z "$TOKEN" ]; then
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
             echo "OAuth Token not generated"
             exit 1
           fi
 
           echo "OAuth Token generated successfully."
 
+      - name: List Packages
+        run: |
+          curl -v \
+            --header "Authorization: Bearer $TOKEN" \
+            "${{ secrets.BASE_URL }}/api/v1/IntegrationPackages"
+
       - name: Get Package Details
         run: |
-          curl --fail \
-            --location \
+          curl -v \
             --header "Authorization: Bearer $TOKEN" \
             "${{ secrets.BASE_URL }}/api/v1/IntegrationPackages('${{ github.event.inputs.packageId }}')"
 
@@ -62,8 +64,7 @@ jobs:
         run: |
           mkdir -p iflows
 
-          curl --fail \
-            --location \
+          curl -v \
             --header "Authorization: Bearer $TOKEN" \
             "${{ secrets.BASE_URL }}/api/v1/IntegrationPackages('${{ github.event.inputs.packageId }}')/\$value" \
             --output iflows/package.zip
@@ -89,5 +90,7 @@ jobs:
           fi
 
       - name: Push Changes
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           git push origin HEAD:${{ github.ref_name }}
