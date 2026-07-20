@@ -78,15 +78,11 @@ jobs:
       - name: Extract Artifact
         shell: bash
         run: |
+            echo "==============================="
+            echo "All Artifacts in Package"
+            echo "==============================="
 
-          ARTIFACT_ID=$(jq -r '.d.results[0].Id' artifacts.json)
-          VERSION=$(jq -r '.d.results[0].Version' artifacts.json)
-
-          echo "Artifact ID : $ARTIFACT_ID"
-          echo "Version     : $VERSION"
-
-          echo "ARTIFACT_ID=$ARTIFACT_ID" >> $GITHUB_ENV
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
+            jq '.d.results' artifacts.json
 
       # Download Artifact
       - name: Download Artifact
