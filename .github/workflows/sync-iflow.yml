@@ -85,17 +85,44 @@ jobs:
 
           jq -r '.d.results[] | "\(.Id) | \(.Version)"' artifacts.json
 
-      # Download Artifact
-      - name: Download Artifact
+      # Download All Artifacts
+      - name: Download All Artifacts
         shell: bash
         run: |
 
           mkdir -p iflows
 
-          curl -L \
-            -H "Authorization: Bearer $TOKEN" \
-            "${{ secrets.BASE_URL }}/api/v1/IntegrationDesigntimeArtifacts(Id='${ARTIFACT_ID}',Version='${VERSION}')/\$value" \
-            --output "iflows/${ARTIFACT_ID}.zip"
+          echo "===================================="
+          echo "Downloading All Artifacts"
+          echo "===================================="
+
+          jq -c '.d.results[]' artifacts.json | while read artifact
+          do
+
+            ID=$(echo "$artifact" | jq -r '.Id')
+            VERSION=$(echo "$artifact" | jq -r '.Version')
+
+            echo ""
+            echo "Downloading Artifact : $ID"
+            echo "Version             : $VERSION"
+
+            curl -L \
+              -H "Authorization: Bearer $TOKEN" \
+              "${{ secrets.BASE_URL }}/api/v1/IntegrationDesigntimeArtifacts(Id='${ID}',Version='${VERSION}')/\$value" \
+              --output "iflows/${ID}.zip"
+
+            if [ $? -eq 0 ]; then
+              echo "✅ Successfully downloaded $ID.zip"
+            else
+              echo "❌ Failed to download $ID"
+            fi
+
+          done
+
+          echo ""
+          echo "===================================="
+          echo "Download Completed"
+          echo "===================================="
 
       # Show Files
       - name: Show Files
