@@ -26,23 +26,28 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y jq
+
+      # Verify Secrets
       - name: Verify Secrets
         run: |
           echo "TOKEN_URL: ${{ secrets.TOKEN_URL }}"
           echo "CLIENT_ID length: ${#CLIENT_ID}"
         env:
           CLIENT_ID: ${{ secrets.CLIENT_ID }}
-          
+
       # Generate OAuth Token
       - name: Generate OAuth Token
+        env:
+          TOKEN_URL: ${{ secrets.TOKEN_URL }}
+          CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
         shell: bash
         run: |
 
-          RESPONSE=$(curl -s -X POST "${{ secrets.TOKEN_URL }}" \
+          RESPONSE=$(curl -s -X POST "$TOKEN_URL" \
+            -u "$CLIENT_ID:$CLIENT_SECRET" \
             -H "Content-Type: application/x-www-form-urlencoded" \
-            --data-urlencode "grant_type=client_credentials" \
-            --data-urlencode "client_id=${{ secrets.CLIENT_ID }}" \
-            --data-urlencode "client_secret=${{ secrets.CLIENT_SECRET }}")
+            -d "grant_type=client_credentials")
 
           echo "$RESPONSE"
 
