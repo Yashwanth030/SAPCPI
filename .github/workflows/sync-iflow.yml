@@ -26,7 +26,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y jq
-
+      - name: Verify Secrets
+        run: |
+          echo "TOKEN_URL: ${{ secrets.TOKEN_URL }}"
+          echo "CLIENT_ID length: ${#CLIENT_ID}"
+        env:
+          CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          
       # Generate OAuth Token
       - name: Generate OAuth Token
         shell: bash
