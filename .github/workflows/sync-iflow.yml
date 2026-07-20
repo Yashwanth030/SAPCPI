@@ -74,15 +74,16 @@ jobs:
 
           echo "$RESPONSE" > artifacts.json
 
-      # Extract First Artifact
-      - name: Extract Artifact
+      # Extract All Artifacts
+      - name: Extract All Artifacts
         shell: bash
         run: |
-            echo "==============================="
-            echo "All Artifacts in Package"
-            echo "==============================="
 
-            jq '.d.results' artifacts.json
+          echo "===================================="
+          echo "Artifacts Found"
+          echo "===================================="
+
+          jq -r '.d.results[] | "\(.Id) | \(.Version)"' artifacts.json
 
       # Download Artifact
       - name: Download Artifact
