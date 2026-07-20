@@ -19,45 +19,67 @@ jobs:
   sync:
     runs-on: ubuntu-latest
 
+    env:
+      PACKAGE_ID: ${{ github.event.inputs.packageId || 'Yashwanth' }}
+
     steps:
 
+      ####################################################
       # Checkout Repository
+      ####################################################
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # Read Previous Sync State
-      - name: Read Previous Sync State
-        shell: bash
-        run: |
-
-          echo "===================================="
-          echo "Checking Previous Sync State"
-          echo "===================================="
-
-          if [ -f sync-state.json ]; then
-            echo "Previous Sync State Found"
-            cat sync-state.json
-            
-          else
-            echo "No Previous Sync State Found"
-            echo "{}" > sync-state.json
-          fi
-
+      ####################################################
       # Install jq
+      ####################################################
       - name: Install jq
         run: |
           sudo apt-get update
           sudo apt-get install -y jq
 
-      # Verify Secrets
-      - name: Verify Secrets
+      ####################################################
+      # Read Previous Sync State
+      ####################################################
+      - name: Read Previous Sync State
+        shell: bash
         run: |
-          echo "TOKEN_URL: ${{ secrets.TOKEN_URL }}"
-          echo "CLIENT_ID length: ${#CLIENT_ID}"
+
+          mkdir -p sync
+          mkdir -p "packages/${PACKAGE_ID}/IFlows"
+          mkdir -p temp
+
+          echo "===================================="
+          echo "Checking Previous Sync State"
+          echo "===================================="
+
+          if [ -f "sync/${PACKAGE_ID}.json" ]; then
+
+            echo "Previous Sync State Found"
+            cat "sync/${PACKAGE_ID}.json"
+
+          else
+
+            echo "No Previous Sync State Found"
+
+            echo "{}" > "sync/${PACKAGE_ID}.json"
+
+          fi
+
+      ####################################################
+      # Verify Secrets
+      ####################################################
+      - name: Verify Secrets
         env:
           CLIENT_ID: ${{ secrets.CLIENT_ID }}
+        run: |
 
+          echo "TOKEN_URL : ${{ secrets.TOKEN_URL }}"
+          echo "CLIENT_ID Length : ${#CLIENT_ID}"
+
+      ####################################################
       # Generate OAuth Token
+      ####################################################
       - name: Generate OAuth Token
         env:
           TOKEN_URL: ${{ secrets.TOKEN_URL }}
@@ -71,33 +93,44 @@ jobs:
             -H "Content-Type: application/x-www-form-urlencoded" \
             -d "grant_type=client_credentials")
 
-          echo "$RESPONSE"
-
           TOKEN=$(echo "$RESPONSE" | jq -r '.access_token')
 
           if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
-            echo "OAuth Token generation failed."
+
+            echo "OAuth Token Generation Failed"
+
+            echo "$RESPONSE"
+
             exit 1
+
           fi
 
           echo "TOKEN=$TOKEN" >> $GITHUB_ENV
 
-      # Get Artifacts from Package
+      ####################################################
+      # Get Package Artifacts
+      ####################################################
       - name: Get Package Artifacts
         shell: bash
         run: |
 
+          echo "===================================="
+          echo "Fetching Package Artifacts"
+          echo "===================================="
+
           RESPONSE=$(curl -s \
             -H "Authorization: Bearer $TOKEN" \
             -H "Accept: application/json" \
-            "${{ secrets.BASE_URL }}/api/v1/IntegrationPackages('${{ github.event.inputs.packageId }}')/IntegrationDesigntimeArtifacts")
+            "${{ secrets.BASE_URL }}/api/v1/IntegrationPackages('${PACKAGE_ID}')/IntegrationDesigntimeArtifacts")
 
           echo "$RESPONSE"
 
-          echo "$RESPONSE" > artifacts.json
+          echo "$RESPONSE" > temp/artifacts.json
 
-      # Extract All Artifacts
-      - name: Extract All Artifacts
+      ####################################################
+      # Extract Artifacts
+      ####################################################
+      - name: Extract Artifacts
         shell: bash
         run: |
 
@@ -105,50 +138,50 @@ jobs:
           echo "Artifacts Found"
           echo "===================================="
 
-          jq -r '.d.results[] | "\(.Id) | \(.Version)"' artifacts.json
+          jq -r '.d.results[] | "\(.Id) | Version : \(.Version)"' temp/artifacts.json
 
+      ####################################################
       # Delta Sync Download
+      ####################################################
       - name: Delta Sync Download
         shell: bash
         run: |
-
-          mkdir -p iflows
 
           echo "===================================="
           echo "Delta Synchronization Started"
           echo "===================================="
 
-          jq -c '.d.results[]' artifacts.json | while read artifact
+          jq -c '.d.results[]' temp/artifacts.json | while read artifact
           do
 
             ID=$(echo "$artifact" | jq -r '.Id')
             VERSION=$(echo "$artifact" | jq -r '.Version')
             MODIFIED=$(echo "$artifact" | jq -r '.ModifiedAt')
 
-            OLD_MODIFIED=$(jq -r --arg id "$ID" '.[$id] // empty' sync-state.json)
+            OLD_MODIFIED=$(jq -r --arg id "$ID" '.[$id] // empty' "sync/${PACKAGE_ID}.json")
 
             echo ""
-            echo "-------------------------------------"
+            echo "----------------------------------------"
             echo "Artifact : $ID"
-            echo "SAP ModifiedAt : $MODIFIED"
-            echo "Previous Sync  : ${OLD_MODIFIED:-Not Found}"
+            echo "Current ModifiedAt : $MODIFIED"
+            echo "Previous ModifiedAt : ${OLD_MODIFIED:-Not Found}"
 
             if [ "$MODIFIED" = "$OLD_MODIFIED" ]; then
 
-                echo "No Changes Detected"
-                echo "Skipping Download"
+              echo "No Changes Detected"
+              echo "Skipping Download"
 
             else
 
-                echo "Changes Detected"
-                echo "Downloading..."
+              echo "Changes Detected"
+              echo "Downloading..."
 
-                curl -L \
-                  -H "Authorization: Bearer $TOKEN" \
-                  "${{ secrets.BASE_URL }}/api/v1/IntegrationDesigntimeArtifacts(Id='${ID}',Version='${VERSION}')/\$value" \
-                  --output "iflows/${ID}.zip"
+              curl -L \
+                -H "Authorization: Bearer $TOKEN" \
+                "${{ secrets.BASE_URL }}/api/v1/IntegrationDesigntimeArtifacts(Id='${ID}',Version='${VERSION}')/\$value" \
+                --output "packages/${PACKAGE_ID}/IFlows/${ID}.zip"
 
-                echo "Downloaded ${ID}.zip"
+              echo "Downloaded ${ID}.zip"
 
             fi
 
@@ -158,48 +191,69 @@ jobs:
           echo "===================================="
           echo "Delta Sync Completed"
           echo "===================================="
-          
+
+      ####################################################
       # Create Sync State
+      ####################################################
       - name: Create Sync State
         shell: bash
         run: |
 
           echo "===================================="
-          echo "Creating sync-state.json"
+          echo "Updating Sync State"
           echo "===================================="
 
           jq '
             .d.results
             | map({(.Id): .ModifiedAt})
             | add
-          ' artifacts.json > sync-state.json
+          ' temp/artifacts.json > "sync/${PACKAGE_ID}.json"
 
-          echo ""
+          cat "sync/${PACKAGE_ID}.json"
 
-          cat sync-state.json
-          
-      # Show Files
+      ####################################################
+      # Cleanup
+      ####################################################
+      - name: Cleanup Temporary Files
+        run: |
+          rm -rf temp
+
+      ####################################################
+      # Show Repository Structure
+      ####################################################
       - name: Show Files
         run: |
           ls -R
 
+      ####################################################
       # Configure Git
+      ####################################################
       - name: Configure Git
         run: |
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git config --global user.name "github-actions[bot]"
 
-      # Commit
+      ####################################################
+      # Commit Changes
+      ####################################################
       - name: Commit Changes
         run: |
+
           git add .
+
           if git diff --cached --quiet; then
-            echo "No changes detected."
+
+            echo "No Changes Detected"
+
           else
-            git commit -m "Delta Sync - $(date -u '+%Y-%m-%d %H:%M UTC')"
+
+            git commit -m "Delta Sync (${PACKAGE_ID}) - $(date -u '+%Y-%m-%d %H:%M UTC')"
+
           fi
 
+      ####################################################
       # Push
+      ####################################################
       - name: Push Changes
         run: |
           git push
