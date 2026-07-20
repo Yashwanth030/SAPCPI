@@ -21,6 +21,24 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      # Read Previous Sync State
+      - name: Read Previous Sync State
+        shell: bash
+        run: |
+
+          echo "===================================="
+          echo "Checking Previous Sync State"
+          echo "===================================="
+
+          if [ -f sync-state.json ]; then
+            echo "Previous Sync State Found"
+            cat sync-state.json
+            
+          else
+            echo "No Previous Sync State Found"
+            echo "{}" > sync-state.json
+          fi
+
       # Install jq
       - name: Install jq
         run: |
