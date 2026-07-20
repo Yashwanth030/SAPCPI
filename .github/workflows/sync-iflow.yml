@@ -103,15 +103,15 @@ jobs:
 
           jq -r '.d.results[] | "\(.Id) | \(.Version)"' artifacts.json
 
-      # Download All Artifacts
-      - name: Download All Artifacts
+      # Delta Sync Download
+      - name: Delta Sync Download
         shell: bash
         run: |
 
           mkdir -p iflows
 
           echo "===================================="
-          echo "Downloading All Artifacts"
+          echo "Delta Synchronization Started"
           echo "===================================="
 
           jq -c '.d.results[]' artifacts.json | while read artifact
@@ -119,28 +119,42 @@ jobs:
 
             ID=$(echo "$artifact" | jq -r '.Id')
             VERSION=$(echo "$artifact" | jq -r '.Version')
+            MODIFIED=$(echo "$artifact" | jq -r '.ModifiedAt')
+
+            OLD_MODIFIED=$(jq -r --arg id "$ID" '.[$id] // empty' sync-state.json)
 
             echo ""
-            echo "Downloading Artifact : $ID"
-            echo "Version             : $VERSION"
+            echo "-------------------------------------"
+            echo "Artifact : $ID"
+            echo "SAP ModifiedAt : $MODIFIED"
+            echo "Previous Sync  : ${OLD_MODIFIED:-Not Found}"
 
-            curl -L \
-              -H "Authorization: Bearer $TOKEN" \
-              "${{ secrets.BASE_URL }}/api/v1/IntegrationDesigntimeArtifacts(Id='${ID}',Version='${VERSION}')/\$value" \
-              --output "iflows/${ID}.zip"
+            if [ "$MODIFIED" = "$OLD_MODIFIED" ]; then
 
-            if [ $? -eq 0 ]; then
-              echo "✅ Successfully downloaded $ID.zip"
+                echo "No Changes Detected"
+                echo "Skipping Download"
+
             else
-              echo "❌ Failed to download $ID"
+
+                echo "Changes Detected"
+                echo "Downloading..."
+
+                curl -L \
+                  -H "Authorization: Bearer $TOKEN" \
+                  "${{ secrets.BASE_URL }}/api/v1/IntegrationDesigntimeArtifacts(Id='${ID}',Version='${VERSION}')/\$value" \
+                  --output "iflows/${ID}.zip"
+
+                echo "Downloaded ${ID}.zip"
+
             fi
 
           done
 
           echo ""
           echo "===================================="
-          echo "Download Completed"
+          echo "Delta Sync Completed"
           echo "===================================="
+          
       # Create Sync State
       - name: Create Sync State
         shell: bash
