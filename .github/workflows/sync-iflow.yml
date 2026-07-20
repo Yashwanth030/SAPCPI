@@ -8,8 +8,12 @@ on:
     inputs:
       packageId:
         description: "Enter SAP Package ID"
-        required: true
+        required: false
+        default: "Yashwanth"
         type: string
+
+  schedule:
+    - cron: '0 2 * * *'
 
 jobs:
   sync:
