@@ -123,7 +123,25 @@ jobs:
           echo "===================================="
           echo "Download Completed"
           echo "===================================="
+      # Create Sync State
+      - name: Create Sync State
+        shell: bash
+        run: |
 
+          echo "===================================="
+          echo "Creating sync-state.json"
+          echo "===================================="
+
+          jq '
+            .d.results
+            | map({(.Id): .ModifiedAt})
+            | add
+          ' artifacts.json > sync-state.json
+
+          echo ""
+
+          cat sync-state.json
+          
       # Show Files
       - name: Show Files
         run: |
