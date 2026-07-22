@@ -1,1 +1,661 @@
+name: Deploy SAP CPI iFlows
 
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      packageIds:
+        description: "Comma-separated SAP Package ID(s). Leave empty to deploy every folder under packages/"
+        required: false
+        default: ""
+        type: string
+
+  workflow_run:
+    workflows: ["Sync SAP CPI Package"]
+    types:
+      - completed
+
+jobs:
+
+  ######################################################################
+  # JOB 1 - Discover which packages need to be deployed
+  ######################################################################
+  discover:
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    outputs:
+      packages: ${{ steps.list.outputs.packages }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Determine Package List
+        id: list
+        shell: bash
+        run: |
+
+          echo "===================================="
+          echo "Discovering Packages To Deploy"
+          echo "===================================="
+
+          INPUT_IDS="${{ github.event.inputs.packageIds }}"
+
+          if [ -n "$INPUT_IDS" ]; then
+
+            echo "Using explicit packageIds input: $INPUT_IDS"
+
+            IFS=',' read -ra ARR <<< "$INPUT_IDS"
+
+            TRIMMED=()
+            for p in "${ARR[@]}"; do
+              TRIMMED+=("$(echo "$p" | xargs)")
+            done
+
+            JSON=$(printf '%s\n' "${TRIMMED[@]}" | jq -R . | jq -sc .)
+
+          else
+
+            echo "No packageIds input provided - discovering from packages/ directory"
+
+            if [ -d "packages" ]; then
+              JSON=$(ls -1 packages | jq -R . | jq -sc .)
+            else
+              JSON="[]"
+            fi
+
+          fi
+
+          echo "Packages to deploy: $JSON"
+
+          if [ "$JSON" = "[]" ] || [ -z "$JSON" ]; then
+            echo "No packages found to deploy. Failing fast."
+            exit 1
+          fi
+
+          echo "packages=$JSON" >> "$GITHUB_OUTPUT"
+
+  ######################################################################
+  # JOB 2 - Deploy each package (parallel matrix)
+  ######################################################################
+  deploy:
+    needs: discover
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package: ${{ fromJson(needs.discover.outputs.packages) }}
+
+    env:
+      PACKAGE_ID: ${{ matrix.package }}
+      BASE_URL: ${{ secrets.BASE_URL }}
+
+    outputs:
+      status: ${{ steps.summary.outputs.status }}
+
+    steps:
+
+      ####################################################
+      # Checkout Repository
+      ####################################################
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      ####################################################
+      # Install jq
+      ####################################################
+      - name: Install jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      ####################################################
+      # Prepare Working Directories
+      ####################################################
+      - name: Prepare Working Directories
+        run: |
+          mkdir -p "packages/${PACKAGE_ID}/IFlows"
+          mkdir -p deployments
+          mkdir -p temp
+          echo "[]" > "temp/${PACKAGE_ID}-results.json"
+
+      ####################################################
+      # Verify Secrets
+      ####################################################
+      - name: Verify Secrets
+        env:
+          CLIENT_ID: ${{ secrets.CLIENT_ID }}
+        run: |
+          echo "Package : $PACKAGE_ID"
+          echo "TOKEN_URL : ${{ secrets.TOKEN_URL }}"
+          echo "BASE_URL  : ${{ secrets.BASE_URL }}"
+          echo "CLIENT_ID Length : ${#CLIENT_ID}"
+
+      ####################################################
+      # Generate OAuth Token
+      ####################################################
+      - name: Generate OAuth Token
+        env:
+          TOKEN_URL: ${{ secrets.TOKEN_URL }}
+          CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+        shell: bash
+        run: |
+
+          echo "===================================="
+          echo "Requesting OAuth Token"
+          echo "===================================="
+
+          RESPONSE=$(curl -s -X POST "$TOKEN_URL" \
+            -u "$CLIENT_ID:$CLIENT_SECRET" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -d "grant_type=client_credentials")
+
+          TOKEN=$(echo "$RESPONSE" | jq -r '.access_token')
+
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+            echo "::error::OAuth Token Generation Failed"
+            echo "$RESPONSE"
+            exit 1
+          fi
+
+          echo "OAuth Token acquired successfully"
+          echo "TOKEN=$TOKEN" >> "$GITHUB_ENV"
+
+      ####################################################
+      # Fetch CSRF Token + Session Cookie
+      ####################################################
+      - name: Fetch CSRF Token
+        shell: bash
+        run: |
+
+          echo "===================================="
+          echo "Fetching CSRF Token"
+          echo "===================================="
+
+          curl -s -D temp/csrf-headers.txt -o /dev/null \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "X-CSRF-Token: Fetch" \
+            "${BASE_URL}/api/v1/"
+
+          CSRF_TOKEN=$(grep -i '^x-csrf-token:' temp/csrf-headers.txt | awk '{print $2}' | tr -d '\r')
+
+          if [ -z "$CSRF_TOKEN" ]; then
+            echo "::error::Failed to retrieve CSRF token"
+            cat temp/csrf-headers.txt
+            exit 1
+          fi
+
+          COOKIES=$(grep -i '^set-cookie:' temp/csrf-headers.txt | sed 's/^[Ss]et-[Cc]ookie: //' | cut -d';' -f1 | tr '\n' ';')
+
+          echo "CSRF Token acquired successfully"
+
+          echo "CSRF_TOKEN=$CSRF_TOKEN" >> "$GITHUB_ENV"
+          echo "COOKIES=$COOKIES" >> "$GITHUB_ENV"
+
+      ####################################################
+      # Create / Update iFlows (Base64 Upload)
+      ####################################################
+      - name: Create Or Update iFlows
+        shell: bash
+        run: |
+
+          echo "===================================="
+          echo "Create / Update Phase - Package: $PACKAGE_ID"
+          echo "===================================="
+
+          shopt -s nullglob
+          ZIPS=(packages/${PACKAGE_ID}/IFlows/*.zip)
+
+          if [ ${#ZIPS[@]} -eq 0 ]; then
+            echo "::warning::No ZIP files found for package $PACKAGE_ID. Nothing to deploy."
+            exit 0
+          fi
+
+          for ZIP_PATH in "${ZIPS[@]}"; do
+
+            ARTIFACT_ID=$(basename "$ZIP_PATH" .zip)
+
+            echo ""
+            echo "----------------------------------------"
+            echo "Artifact : $ARTIFACT_ID"
+            echo "File     : $ZIP_PATH"
+
+            BASE64_CONTENT=$(base64 -w 0 "$ZIP_PATH")
+
+            echo "Checking whether artifact already exists..."
+
+            EXISTS_HTTP_CODE=$(curl -s -o temp/exists-response.json -w "%{http_code}" \
+              -H "Authorization: Bearer $TOKEN" \
+              -H "Accept: application/json" \
+              "${BASE_URL}/api/v1/IntegrationDesigntimeArtifacts(Id='${ARTIFACT_ID}',Version='active')")
+
+            ACTION=""
+            HTTP_CODE=""
+            RESPONSE_FILE=""
+            STATUS=""
+
+            if [ "$EXISTS_HTTP_CODE" = "200" ]; then
+
+              echo "Artifact exists (HTTP 200) - performing UPDATE"
+
+              PAYLOAD=$(jq -n \
+                --arg Name "$ARTIFACT_ID" \
+                --arg Id "$ARTIFACT_ID" \
+                --arg PackageId "$PACKAGE_ID" \
+                --arg Content "$BASE64_CONTENT" \
+                '{Name: $Name, Id: $Id, PackageId: $PackageId, ArtifactContent: $Content}')
+
+              HTTP_CODE=$(curl -s -o temp/update-response.json -w "%{http_code}" \
+                -X PUT \
+                -H "Authorization: Bearer $TOKEN" \
+                -H "X-CSRF-Token: $CSRF_TOKEN" \
+                -H "Cookie: $COOKIES" \
+                -H "Content-Type: application/json" \
+                -d "$PAYLOAD" \
+                "${BASE_URL}/api/v1/IntegrationDesigntimeArtifacts(Id='${ARTIFACT_ID}',Version='active')")
+
+              ACTION="update"
+              RESPONSE_FILE="temp/update-response.json"
+
+            elif [ "$EXISTS_HTTP_CODE" = "404" ]; then
+
+              echo "Artifact not found (HTTP 404) - performing CREATE"
+
+              PAYLOAD=$(jq -n \
+                --arg Name "$ARTIFACT_ID" \
+                --arg Id "$ARTIFACT_ID" \
+                --arg PackageId "$PACKAGE_ID" \
+                --arg Content "$BASE64_CONTENT" \
+                '{Name: $Name, Id: $Id, PackageId: $PackageId, ArtifactContent: $Content}')
+
+              HTTP_CODE=$(curl -s -o temp/create-response.json -w "%{http_code}" \
+                -X POST \
+                -H "Authorization: Bearer $TOKEN" \
+                -H "X-CSRF-Token: $CSRF_TOKEN" \
+                -H "Cookie: $COOKIES" \
+                -H "Content-Type: application/json" \
+                -d "$PAYLOAD" \
+                "${BASE_URL}/api/v1/IntegrationDesigntimeArtifacts")
+
+              ACTION="create"
+              RESPONSE_FILE="temp/create-response.json"
+
+            else
+
+              echo "::error::Existence check for $ARTIFACT_ID returned unexpected HTTP $EXISTS_HTTP_CODE - not assuming create or update"
+              cat temp/exists-response.json 2>/dev/null || true
+
+              ACTION="existence_check"
+              STATUS="upload_failed"
+
+            fi
+
+            if [ "$STATUS" = "upload_failed" ]; then
+
+              : # already marked failed above - existence check did not return 200 or 404
+
+            elif [[ "$HTTP_CODE" == 2* ]]; then
+
+              echo "$ACTION succeeded for $ARTIFACT_ID (HTTP $HTTP_CODE)"
+              STATUS="uploaded"
+
+            else
+
+              echo "::error::$ACTION FAILED for $ARTIFACT_ID (HTTP $HTTP_CODE)"
+              cat "$RESPONSE_FILE" 2>/dev/null || true
+              STATUS="upload_failed"
+
+            fi
+
+            RESULTS=$(cat "temp/${PACKAGE_ID}-results.json")
+            RESULTS=$(echo "$RESULTS" | jq \
+              --arg id "$ARTIFACT_ID" \
+              --arg action "$ACTION" \
+              --arg status "$STATUS" \
+              '. + [{artifact: $id, action: $action, uploadStatus: $status}]')
+            echo "$RESULTS" > "temp/${PACKAGE_ID}-results.json"
+
+          done
+
+      ####################################################
+      # Deploy iFlows
+      ####################################################
+      - name: Deploy iFlows
+        shell: bash
+        run: |
+
+          echo "===================================="
+          echo "Deploy Phase - Package: $PACKAGE_ID"
+          echo "===================================="
+
+          RESULTS=$(cat "temp/${PACKAGE_ID}-results.json")
+          COUNT=$(echo "$RESULTS" | jq 'length')
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "No artifacts to deploy for $PACKAGE_ID"
+            exit 0
+          fi
+
+          for i in $(seq 0 $((COUNT - 1))); do
+
+            ARTIFACT_ID=$(echo "$RESULTS" | jq -r ".[$i].artifact")
+            UPLOAD_STATUS=$(echo "$RESULTS" | jq -r ".[$i].uploadStatus")
+
+            echo ""
+            echo "----------------------------------------"
+            echo "Artifact : $ARTIFACT_ID"
+
+            if [ "$UPLOAD_STATUS" != "uploaded" ]; then
+              echo "Skipping deploy - upload previously failed"
+              RESULTS=$(echo "$RESULTS" | jq --argjson i "$i" '.[$i].deployStatus = "skipped"')
+              echo "$RESULTS" > "temp/${PACKAGE_ID}-results.json"
+              continue
+            fi
+
+            echo "Triggering deploy..."
+
+            HTTP_CODE=$(curl -s -o temp/deploy-response.json -w "%{http_code}" \
+              -X POST \
+              -H "Authorization: Bearer $TOKEN" \
+              -H "X-CSRF-Token: $CSRF_TOKEN" \
+              -H "Cookie: $COOKIES" \
+              "${BASE_URL}/api/v1/DeployIntegrationDesigntimeArtifact?Id='${ARTIFACT_ID}'&Version='active'")
+
+            if [[ "$HTTP_CODE" != 2* ]]; then
+              echo "::error::Deploy trigger failed for $ARTIFACT_ID (HTTP $HTTP_CODE)"
+              cat temp/deploy-response.json 2>/dev/null || true
+              RESULTS=$(echo "$RESULTS" | jq --argjson i "$i" '.[$i].deployStatus = "deploy_trigger_failed"')
+              echo "$RESULTS" > "temp/${PACKAGE_ID}-results.json"
+              continue
+            fi
+
+            echo "Raw deploy response (verify field names against this if extraction below fails):"
+            cat temp/deploy-response.json 2>/dev/null || true
+            echo ""
+
+            ####################################################
+            # Extract TaskId returned by the deploy call
+            ####################################################
+            # SAP tenants vary in exactly how/where this comes back. Try the
+            # common shapes in order, then fall back to treating the whole
+            # body as a plain-text task id. If none of these match your
+            # tenant, check the raw response printed above and add the
+            # right jq path here.
+            TASK_ID=$(jq -r '
+              .d.TaskId // .d.taskId // .d.TaskID // .d.ID //
+              .TaskId // .taskId // .TaskID //
+              empty
+            ' temp/deploy-response.json 2>/dev/null)
+
+            if [ -z "$TASK_ID" ]; then
+              # Not JSON, or none of the known fields matched - treat the
+              # entire body as a plain-text task id (strip quotes/whitespace).
+              CANDIDATE=$(tr -d '"' < temp/deploy-response.json | tr -d '[:space:]')
+              # Guard against swallowing an actual JSON object we failed to parse
+              if [[ "$CANDIDATE" != "{"* ]] && [ -n "$CANDIDATE" ]; then
+                TASK_ID="$CANDIDATE"
+              fi
+            fi
+
+            if [ -z "$TASK_ID" ]; then
+              echo "::error::Deploy call succeeded (HTTP $HTTP_CODE) but no TaskId was returned for $ARTIFACT_ID"
+              cat temp/deploy-response.json 2>/dev/null || true
+              RESULTS=$(echo "$RESULTS" | jq --argjson i "$i" '.[$i].deployStatus = "no_task_id"')
+              echo "$RESULTS" > "temp/${PACKAGE_ID}-results.json"
+              continue
+            fi
+
+            echo "Deploy triggered successfully (HTTP $HTTP_CODE) - TaskId: $TASK_ID"
+
+            ####################################################
+            # Poll Build And Deploy Status
+            ####################################################
+            # Acceptable terminal states vary slightly by tenant/version,
+            # so we check against a small allow-list rather than one literal.
+            SUCCESS_STATES=("FINISHED" "STARTED" "DEPLOYED" "RUNNING")
+            FAILURE_STATES=("FAILED" "ERROR")
+
+            MAX_ATTEMPTS=30
+            SLEEP_SECONDS=10
+            ATTEMPT=1
+            FINAL_STATUS="TIMEOUT"
+
+            echo "Polling BuildAndDeployStatus for TaskId $TASK_ID (max ${MAX_ATTEMPTS} attempts, ${SLEEP_SECONDS}s interval)..."
+
+            while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+
+              sleep $SLEEP_SECONDS
+
+              POLL_HTTP_CODE=$(curl -s -o temp/poll-response.json -w "%{http_code}" \
+                -H "Authorization: Bearer $TOKEN" \
+                -H "Accept: application/json" \
+                "${BASE_URL}/api/v1/BuildAndDeployStatus(TaskId='${TASK_ID}')")
+
+              if [ "$POLL_HTTP_CODE" = "200" ]; then
+
+                if [ "$ATTEMPT" = "1" ]; then
+                  echo "Raw BuildAndDeployStatus response (verify field name against this if a status never matches):"
+                  cat temp/poll-response.json 2>/dev/null || true
+                  echo ""
+                fi
+
+                # Try the common shapes in order. If your tenant uses a
+                # different property name, check the raw response printed
+                # above (on attempt 1) and add the right jq path here.
+                TASK_STATUS=$(jq -r '
+                  .d.Status // .d.status // .d.State // .d.state // .d.TaskStatus //
+                  .Status // .status // .State //
+                  empty
+                ' temp/poll-response.json)
+
+                echo "Attempt $ATTEMPT/$MAX_ATTEMPTS - Status: ${TASK_STATUS:-UNKNOWN}"
+
+                MATCHED=""
+                for s in "${SUCCESS_STATES[@]}"; do
+                  if [ "$TASK_STATUS" = "$s" ]; then
+                    FINAL_STATUS="$TASK_STATUS"
+                    MATCHED="yes"
+                    break
+                  fi
+                done
+                [ -n "$MATCHED" ] && break
+
+                for s in "${FAILURE_STATES[@]}"; do
+                  if [ "$TASK_STATUS" = "$s" ]; then
+                    FINAL_STATUS="$TASK_STATUS"
+                    MATCHED="yes"
+                    break
+                  fi
+                done
+                [ -n "$MATCHED" ] && break
+
+              else
+
+                echo "Attempt $ATTEMPT/$MAX_ATTEMPTS - BuildAndDeployStatus endpoint returned HTTP $POLL_HTTP_CODE"
+
+              fi
+
+              ATTEMPT=$((ATTEMPT + 1))
+
+            done
+
+            echo "Final deployment status for $ARTIFACT_ID: $FINAL_STATUS"
+
+            RESULTS=$(echo "$RESULTS" | jq --argjson i "$i" --arg s "$FINAL_STATUS" --arg t "$TASK_ID" \
+              '.[$i].deployStatus = $s | .[$i].taskId = $t')
+            echo "$RESULTS" > "temp/${PACKAGE_ID}-results.json"
+
+          done
+
+          cp "temp/${PACKAGE_ID}-results.json" "deployments/${PACKAGE_ID}-results.json"
+
+          echo ""
+          echo "===================================="
+          echo "Deployment Results - $PACKAGE_ID"
+          echo "===================================="
+          cat "deployments/${PACKAGE_ID}-results.json"
+
+      ####################################################
+      # Evaluate Job Result
+      ####################################################
+      - name: Evaluate Deployment Result
+        id: summary
+        shell: bash
+        run: |
+
+          RESULTS_FILE="deployments/${PACKAGE_ID}-results.json"
+
+          if [ ! -f "$RESULTS_FILE" ]; then
+            echo "status=no_artifacts" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          FAILURES=$(jq '[.[] | select(.deployStatus as $s | (["FINISHED","STARTED","DEPLOYED","RUNNING"] | index($s)) | not)] | length' "$RESULTS_FILE")
+
+          {
+            echo "## Deployment Summary - Package: $PACKAGE_ID"
+            echo ""
+            echo "| Artifact | Action | Upload | Deploy | TaskId |"
+            echo "|---|---|---|---|---|"
+            jq -r '.[] | "| \(.artifact) | \(.action // "-") | \(.uploadStatus // "-") | \(.deployStatus // "-") | \(.taskId // "-") |"' "$RESULTS_FILE"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$FAILURES" -gt 0 ]; then
+            echo "status=failed" >> "$GITHUB_OUTPUT"
+            echo "::error::$FAILURES artifact(s) failed to deploy cleanly for package $PACKAGE_ID"
+            exit 1
+          else
+            echo "status=success" >> "$GITHUB_OUTPUT"
+          fi
+
+      ####################################################
+      # Upload Result Artifact (consumed by the record job)
+      ####################################################
+      - name: Upload Deployment Result Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-result-${{ matrix.package }}
+          path: deployments/${{ matrix.package }}-results.json
+          if-no-files-found: ignore
+
+      ####################################################
+      # Cleanup
+      ####################################################
+      - name: Cleanup Temporary Files
+        if: always()
+        run: |
+          rm -rf temp
+
+  ######################################################################
+  # JOB 3 - Merge results from all packages, single commit + push
+  ######################################################################
+  record:
+    needs: deploy
+    if: always()
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Download All Deployment Result Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: temp/artifacts
+          pattern: deployment-result-*
+          merge-multiple: false
+
+      - name: Merge Deployment Records
+        shell: bash
+        run: |
+
+          mkdir -p deployments
+
+          echo "===================================="
+          echo "Merging Deployment Results"
+          echo "===================================="
+
+          if [ -d "temp/artifacts" ]; then
+            find temp/artifacts -name "*-results.json" -print0 | while IFS= read -r -d '' f; do
+              cp "$f" "deployments/$(basename "$f")"
+              echo "Recorded: $(basename "$f")"
+            done
+          else
+            echo "No deployment artifacts found to merge"
+          fi
+
+      ####################################################
+      # Configure Git
+      ####################################################
+      - name: Configure Git
+        run: |
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+
+      ####################################################
+      # Commit Changes
+      ####################################################
+      - name: Commit Deployment Records
+        run: |
+
+          git add deployments/
+
+          if git diff --cached --quiet; then
+            echo "No Changes Detected"
+          else
+            git commit -m "Deploy iFlows - $(date -u '+%Y-%m-%d %H:%M UTC')"
+          fi
+
+      ####################################################
+      # Push (with rebase retry to avoid races)
+      ####################################################
+      - name: Push Changes
+        run: |
+
+          for i in 1 2 3 4 5; do
+
+            git pull --rebase origin "${GITHUB_REF_NAME}" && git push && break
+
+            echo "Push attempt $i failed - retrying..."
+            sleep 5
+
+          done
+
+      ####################################################
+      # Fail Workflow If Any Package Deployment Failed
+      ####################################################
+      - name: Check Overall Deployment Status
+        shell: bash
+        run: |
+
+          FAILED=0
+
+          for f in deployments/*-results.json; do
+            [ -e "$f" ] || continue
+            COUNT=$(jq '[.[] | select(.deployStatus as $s | (["FINISHED","STARTED","DEPLOYED","RUNNING"] | index($s)) | not)] | length' "$f")
+            if [ "$COUNT" -gt 0 ]; then
+              echo "::error::Failures found in $f"
+              FAILED=1
+            fi
+          done
+
+          if [ "$FAILED" -eq 1 ]; then
+            echo "::error::One or more package deployments failed. See job summaries above."
+            exit 1
+          fi
+
+          echo "All package deployments completed successfully."
